@@ -1,7 +1,0 @@
-global-exclude .DS_Store
-include ostir/rna_turner1999.par
-include ostir/rna_turner2004.par
-include tests/__init__.py
-include tests/test_ostir.py
-recursive-include tests/input *.csv *.fa *.fasta
-recursive-include tests/expected *.csv

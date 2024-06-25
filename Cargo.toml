@@ -1,0 +1,16 @@
+[package]
+name = "ostir"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+indicatif = "0.17.8"
+librna-sys = "0.2.2"
+num = "0.4.1"
+openmp-sys = "1.2.3"
+polars = "0.40.0"
+
+[profile.release]
+lto = "fat"
