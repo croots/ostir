@@ -8,6 +8,7 @@ use indicatif::ProgressBar;
 mod vienna_wrapper;
 use polars::prelude::*;
 use vienna_wrapper::{mfe, subopt};
+extern crate openmp_sys;
 
 fn main() {
     println!("Hello, world!");

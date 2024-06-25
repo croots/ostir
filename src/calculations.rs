@@ -10,7 +10,7 @@ use std::error::Error;
 ///because it completely ignores cooperative RNA folding mechanisms, such as zipping or strand
 ///displacement. Here, we use it to eliminate mRNA sequences that MAY fold slowly.
 fn calc_kinetic_score(fold: &MonoFoldResult) -> Result<(f64, f64), Box<dyn Error>> {
-    let mrnalen = fold.seqs.len() as i32;
+    let mrnalen = fold.seqs.len() as usize;
     let mut largest_range_helix = 0;
 
     for (nt_x, nt_y) in fold.bp_x.iter().zip(fold.bp_y.iter()) {
@@ -77,10 +77,10 @@ fn calc_spacing_penalty(aligned_spacing: usize) -> f64 {
 fn find_binding_position(start_pos: usize, fold: &CoFoldResult) -> Result<usize, Box<dyn Error>> {
     let seqs = fold.seqs;
 
-    let mut last_bound_rrna: Option<i32> = None;
-    let mut last_bound_mrna: Option<i32> = None;
-    let len_rrna = seqs.1.as_bytes().len() as i32;
-    let len_mrna = seqs.0.as_bytes().len() as i32;
+    let mut last_bound_rrna: Option<usize> = None;
+    let mut last_bound_mrna: Option<usize> = None;
+    let len_rrna = seqs.1.as_bytes().len() as usize;
+    let len_mrna = seqs.0.as_bytes().len() as usize;
     let num_folded_bases = fold.bp_x.len();
     let mut counter: usize = 1;
 
@@ -90,7 +90,7 @@ fn find_binding_position(start_pos: usize, fold: &CoFoldResult) -> Result<usize,
             fold.bp_x[num_folded_bases - counter],
         ) {
             (rrna, _) if rrna < len_mrna => (), // This case is mRNA backfolding
-            (_, mrna) if mrna >= start_pos as i32 => {
+            (_, mrna) if mrna >= start_pos as usize => {
                 return Err("Ribosome is sitting on the start codon")?
             }
             (rrna, mrna) => (last_bound_rrna, last_bound_mrna) = (Some(rrna), Some(mrna)),

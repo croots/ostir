@@ -38,22 +38,22 @@ pub struct UnknownFoldResult<'a> {
     pub seqs: Option<&'a Vec<&'a str>>,
     pub d_g: f32,
     pub dots: String,
-    pub bp_x: Vec<i32>,
-    pub bp_y: Vec<i32>,
+    pub bp_x: Vec<usize>,
+    pub bp_y: Vec<usize>,
 }
 pub struct MonoFoldResult<'a> {
     pub seqs: &'a str,
     pub d_g: f32,
     pub dots: String,
-    pub bp_x: Vec<i32>,
-    pub bp_y: Vec<i32>,
+    pub bp_x: Vec<usize>,
+    pub bp_y: Vec<usize>,
 }
 pub struct CoFoldResult<'a> {
     pub seqs: (&'a str, &'a str),
     pub d_g: f32,
     pub dots: String,
-    pub bp_x: Vec<i32>,
-    pub bp_y: Vec<i32>,
+    pub bp_x: Vec<usize>,
+    pub bp_y: Vec<usize>,
 }
 
 impl<'a> FoldResult<'_> {
@@ -75,7 +75,7 @@ impl<'a> FoldResult<'_> {
         }
     }
 
-    pub fn get_bp_x(&self) -> &Vec<i32> {
+    pub fn get_bp_x(&self) -> &Vec<usize> {
         // Some code here
         match self {
             FoldResult::Mono(x) => return &x.bp_x,
@@ -84,7 +84,7 @@ impl<'a> FoldResult<'_> {
         }
     }
 
-    pub fn get_bp_y(&self) -> &Vec<i32> {
+    pub fn get_bp_y(&self) -> &Vec<usize> {
         // Some code here
         match self {
             FoldResult::Mono(x) => return &x.bp_y,
@@ -97,8 +97,8 @@ impl<'a> FoldResult<'_> {
         sequences: Option<&'a Vec<&'a str>>,
         d_g: f32,
         dots: String,
-        bp_x: Vec<i32>,
-        bp_y: Vec<i32>,
+        bp_x: Vec<usize>,
+        bp_y: Vec<usize>,
     ) -> FoldResult {
         if sequences.is_none() {
             return FoldResult::Unknown(UnknownFoldResult {

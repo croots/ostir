@@ -43,6 +43,33 @@ impl FoldCompound {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use pyo3::prelude::*;
+    use pyo3::types::IntoPyDict;
+
+    #[test]
+    fn python_test() -> PyResult<()> {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            println!("Testing python");
+            let sys = py.import_bound("sys")?;
+            let path = sys.getattr("path")?;
+            let sys = py.import_bound("ostir")?;
+
+            let version: String = sys.getattr("version")?.extract()?;
+            let binary: String = sys.getattr("executable")?.extract()?;
+
+            let locals = [("os", py.import_bound("os")?)].into_py_dict_bound(py);
+            let code = "os.getenv('USER') or os.getenv('USERNAME') or 'Unknown'";
+            let user: String = py.eval_bound(code, None, Some(&locals))?.extract()?;
+
+            println!("Hello {}, I'm Python {} at {}", user, version, binary);
+            Ok(())
+        })
+    }
+}
+
 // MFE ------------
 
 pub fn mfe<'a>(
@@ -179,18 +206,18 @@ pub fn coordinates_to_dots(strands: &Vec<&str>, bp_x: &Vec<usize>, bp_y: &Vec<us
     bracket_notation.iter().collect::<String>()
 }
 
-pub fn dots_to_coordinates(dots_string: &str) -> (Vec<i32>, Vec<i32>) {
-    let mut bp_x: Vec<i32> = vec![];
-    let _unpaired_x_index: Vec<i32> = vec![];
-    let _unpaired_x_pos: Vec<i32> = vec![];
-    let mut bp_y: Vec<i32> = vec![];
+pub fn dots_to_coordinates(dots_string: &str) -> (Vec<usize>, Vec<usize>) {
+    let mut bp_x: Vec<usize> = vec![];
+    let _unpaired_x_index: Vec<usize> = vec![];
+    let _unpaired_x_pos: Vec<usize> = vec![];
+    let mut bp_y: Vec<usize> = vec![];
 
     let _i = 1; // Dot positions are 1 indexed
     let _x_counter = 0;
     let _strand_count = 0;
 
-    let mut _last_x_pos: i32;
-    let mut _last_x_index: i32;
+    let mut _last_x_pos: usize;
+    let mut _last_x_index: usize;
 
     for _ in 0..dots_string.matches(")").count() {
         bp_y.push(0); // Placeholder value to be replaced later

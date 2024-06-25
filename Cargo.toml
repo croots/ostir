@@ -11,6 +11,7 @@ librna-sys = "0.2.2"
 num = "0.4.1"
 openmp-sys = "1.2.3"
 polars = "0.40.0"
+pyo3 = "0.22.0"
 
 [profile.release]
 lto = "fat"
