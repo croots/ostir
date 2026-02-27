@@ -4,7 +4,7 @@ use librna_sys::{
     vrna_mfe, vrna_subopt_cb,
 };
 use std::error::Error;
-use std::ffi::{c_char, c_double, c_float, c_void, CStr};
+use std::ffi::{c_char, c_double, c_float, c_void, CStr, CString};
 use std::mem::MaybeUninit;
 
 // Fold compound struct with safeguards --------
@@ -21,6 +21,9 @@ impl FoldCompound {
             sequence = sequences[0].replace("T", "U").to_uppercase()
         }
 
+        // ViennaRNA requires null-terminated C strings
+        let c_sequence = CString::new(sequence).expect("Sequence contains null byte");
+
         unsafe {
             let mut md = MaybeUninit::<vrna_md_t>::uninit();
             let md_ptr = md.as_mut_ptr();
@@ -28,6 +31,8 @@ impl FoldCompound {
             let mut initialized_md = md.assume_init();
 
             initialized_md.temperature = temp as c_double;
+            // Match Python's ostir parameters: no lonely pairs, no pseudoknots
+            initialized_md.noLP = 1;
 
             let _dangles_int = dangles.as_int();
             match dangles.as_int() {
@@ -35,38 +40,11 @@ impl FoldCompound {
                 Err(_e) => {}
             }
 
-            let c = vrna_fold_compound(sequence.as_ptr() as *const i8, &initialized_md, 1 as u32);
+            let c = vrna_fold_compound(c_sequence.as_ptr(), &initialized_md, 1 as u32);
             // TODO: Add constraints
 
             FoldCompound { c }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use pyo3::prelude::*;
-    use pyo3::types::IntoPyDict;
-
-    #[test]
-    fn python_test() -> PyResult<()> {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            println!("Testing python");
-            let sys = py.import_bound("sys")?;
-            let path = sys.getattr("path")?;
-            let sys = py.import_bound("ostir")?;
-
-            let version: String = sys.getattr("version")?.extract()?;
-            let binary: String = sys.getattr("executable")?.extract()?;
-
-            let locals = [("os", py.import_bound("os")?)].into_py_dict_bound(py);
-            let code = "os.getenv('USER') or os.getenv('USERNAME') or 'Unknown'";
-            let user: String = py.eval_bound(code, None, Some(&locals))?.extract()?;
-
-            println!("Hello {}, I'm Python {} at {}", user, version, binary);
-            Ok(())
-        })
     }
 }
 
@@ -80,19 +58,24 @@ pub fn mfe<'a>(
 ) -> Result<FoldResult<'a>, Box<dyn Error>> {
     // @TODO: Add constraints option
 
-    let dot_vec = vec![0; sequences.join("&").len() + 1];
+    let dot_vec = vec![0u8; sequences.join("&").len() + 1];
     let dot_ptr = dot_vec.as_ptr() as *mut i8;
     let fold_compound = FoldCompound::new(sequences, constraints, dangles, temp);
     let result;
     unsafe {
         result = vrna_mfe(fold_compound.c, dot_ptr);
     }
-    let dot_string = std::str::from_utf8(&dot_vec).expect("TODO: Handle invalid UTF-8");
+    // Use CStr to properly strip the null terminator before processing
+    let dot_cstr = unsafe { CStr::from_ptr(dot_ptr as *const c_char) };
+    let dot_string = dot_cstr.to_str().expect("ViennaRNA returned invalid UTF-8");
     let coordinates = dots_to_coordinates(dot_string);
+
+    // Round to 2 decimal places to match Python's ostir ViennaRNA.mfe() behavior
+    let result_rounded = (result as f64 * 100.0).round() as f32 / 100.0;
 
     return Ok(FoldResult::create(
         Some(sequences),
-        result,
+        result_rounded,
         dot_string.to_string(),
         coordinates.0,
         coordinates.1,
@@ -143,7 +126,7 @@ pub fn subopt<'a>(
     let hybridization_penalty = 2.481 as f32;
 
     let _energy_gap_adjusted = (energy_gap + hybridization_penalty) * 100.0;
-    let energy_gap_rounded: i32 = (energy_gap as f32).round() as i32;
+    let energy_gap_rounded: i32 = ((energy_gap + hybridization_penalty) * 100.0).round() as i32;
 
     unsafe {
         vrna_subopt_cb(
@@ -156,6 +139,18 @@ pub fn subopt<'a>(
 
     resultholder.sort_by(|b, a| b.get_d_g().partial_cmp(&a.get_d_g()).unwrap());
 
+    // When folding multiple sequences, only keep results where rRNA strand has base pairs
+    if sequences.len() > 1 {
+        resultholder.retain(|result| {
+            let dots = result.get_dots();
+            if let Some(rrna_part) = dots.split('&').nth(1) {
+                rrna_part.contains('(') || rrna_part.contains(')')
+            } else {
+                false
+            }
+        });
+    }
+
     return resultholder;
 }
 
@@ -165,16 +160,19 @@ pub fn eval_structure(
     dots: &str,
     temp: f32,
     dangles: &DanglesSetting,
-) -> f32 {
+) -> f64 {
     let adj_dots = dots.replace("&", "");
+    // ViennaRNA requires a null-terminated C string
+    let c_dots = CString::new(adj_dots).expect("Structure string contains null byte");
     let fold_compound = FoldCompound::new(sequences, "", dangles, temp);
 
     let energy: c_float;
     unsafe {
-        energy = vrna_eval_structure(fold_compound.c, adj_dots.as_ptr() as *const i8);
+        energy = vrna_eval_structure(fold_compound.c, c_dots.as_ptr());
     }
 
-    return energy;
+    // Round to 2 decimal places to match Python's ostir ViennaRNA.energy() behavior
+    (energy as f64 * 100.0).round() / 100.0
 }
 
 // Utilities ----------------
@@ -239,7 +237,7 @@ pub fn dots_to_coordinates(dots_string: &str) -> (Vec<usize>, Vec<usize>) {
                     .iter()
                     .position(|&x| x == nt_x.try_into().unwrap())
                     .unwrap();
-                bp_y[nt_x_pos] = (pos - num_strands + 2).try_into().unwrap();
+                bp_y[nt_x_pos] = (pos - num_strands).try_into().unwrap();
             }
             '&' => {
                 num_strands += 1;

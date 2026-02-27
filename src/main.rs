@@ -1,117 +1,254 @@
 mod calculations;
 mod constants;
 mod file_parser;
+mod hybridization;
 mod types;
-pub use file_parser::fileparser;
-pub use file_parser::fileparser::DNASequence;
-use indicatif::ProgressBar;
 mod vienna_wrapper;
-use polars::prelude::*;
-use vienna_wrapper::{mfe, subopt};
+
+use calculations::calc_dg_mrna;
+use clap::Parser;
+use constants::*;
+use hybridization::{calc_dg_mrna_rrna, calc_dg_standby_site};
+use serde::Serialize;
+use std::io;
+use types::DanglesSetting;
+
 extern crate openmp_sys;
 
-fn main() {
-    println!("Hello, world!");
-    let sequences = fileparser::parse_file("test.fasta", 20).unwrap();
+// ── Start codon energies (kcal/mol) ──────────────────────────────────────────
+fn start_codon_energy(codon: &str) -> f64 {
+    match codon.to_uppercase().replace('U', "T").as_str() {
+        "ATG" => -1.194,
+        "GTG" => -0.0748,
+        "TTG" => -0.0435,
+        "CTG" => -0.03406,
+        _ => 0.0,
+    }
+}
 
-    for sequence in sequences {
-        for _next in sequence {
-            //println!("{}", next.sequence);
+// ── Expression level ─────────────────────────────────────────────────────────
+fn calc_expression_level(dg_total: f64) -> f64 {
+    k() * (-dg_total / rt_eff()).exp()
+}
+
+// ── Find start codons (0-indexed positions) ───────────────────────────────────
+fn find_start_codons(sequence: &str, start_range: (usize, usize)) -> Vec<(usize, String)> {
+    let seq_len = sequence.len();
+    if seq_len < 3 {
+        return vec![];
+    }
+    let end_0 = (start_range.1.saturating_sub(1)).min(seq_len - 3);
+    let begin_0 = (start_range.0.saturating_sub(1)).min(end_0);
+    let mut result = Vec::new();
+    for i in begin_0..=end_0 {
+        let codon = &sequence[i..i + 3];
+        match codon.to_uppercase().as_str() {
+            "ATG" | "AUG" | "GTG" | "GUG" | "TTG" | "UUG" | "CTG" | "CUG" => {
+                result.push((i, codon.to_string()));
+            }
+            _ => {}
         }
     }
-
-    let test_seq1 = "TTATGGCGAGCTCTGAAGACGTTATCAAAGAGTTCATGCGTTTCAAAGTTCGTATGGAAGGT";
-    let _test_seq2 = "TTATGGCGAGCTCTGAAGACGTTATCAAAGAGTTCAT";
-    let _test_seq_vec1 = vec![test_seq1];
-    let _test_seq_vec2 = vec![test_seq1, _test_seq2];
-    test_mfe(&_test_seq_vec1);
-    test_subopt(&_test_seq_vec2);
+    result
 }
 
-fn ostir(
-    sequence: DNASequence,
-    start: i64,
-    end: i64,
+// ── Output record ─────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Serialize)]
+pub struct OstirResult {
+    pub name: String,
+    pub start_codon: String,
+    pub start_position: usize, // 1-indexed
+    pub expression: f64,
+    #[serde(rename = "RBS_distance_bp")]
+    pub rbs_distance_bp: i64,
+    #[serde(rename = "dG_total")]
+    pub dg_total: f64,
+    #[serde(rename = "dG_rRNA:mRNA")]
+    pub dg_rrna_mrna: f64,
+    #[serde(rename = "dG_mRNA")]
+    pub dg_mrna: f64,
+    #[serde(rename = "dG_spacing")]
+    pub dg_spacing: f64,
+    #[serde(rename = "dG_standby")]
+    pub dg_standby: f64,
+    #[serde(rename = "dG_start_codon")]
+    pub dg_start_codon: f64,
+}
+
+const DECIMAL_PLACES: u32 = 4;
+const HYBRIDIZATION_PENALTY: f64 = 2.481;
+
+fn round4(x: f64) -> f64 {
+    let factor = 10f64.powi(DECIMAL_PLACES as i32);
+    (x * factor).round() / factor
+}
+
+// ── Main OSTIR calculation ────────────────────────────────────────────────────
+pub fn ostir(
+    sequence: &str,
     name: &str,
+    start_range: (usize, usize), // 1-indexed
     asd: &str,
+) -> Vec<OstirResult> {
+    let mut results: Vec<OstirResult> = Vec::new();
+
+    let start_codons = find_start_codons(sequence, start_range);
+
+    for (start_pos, codon) in start_codons {
+        // Set dangles based on distance from 5' end (Python: "all" if start_pos <= cutoff)
+        let dangles = if start_pos > CUTOFF {
+            DanglesSetting::new("none").unwrap()
+        } else {
+            DanglesSetting::new("all").unwrap()
+        };
+
+        // dG of mRNA secondary structure
+        let dg_mrna = calc_dg_mrna(sequence, start_pos, &dangles);
+
+        // dG of mRNA:rRNA hybridization
+        let mrna_rrna_output =
+            calc_dg_mrna_rrna(sequence, asd, start_pos, &dangles, None);
+
+        let (dg_mrna_rrna_withspacing_raw, structure, spacing_value) = match mrna_rrna_output {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Apply hybridization penalty correction to match NUPACK
+        let dg_mrna_rrna_withspacing = dg_mrna_rrna_withspacing_raw - HYBRIDIZATION_PENALTY;
+        let dg_mrna_rrna_nospacing = structure.dg_mrna_rrna - HYBRIDIZATION_PENALTY;
+
+        // Standby site penalty
+        let dg_standby = calc_dg_standby_site(&structure, asd, &dangles, None);
+
+        // Start codon energy
+        let dg_start_codon = start_codon_energy(&codon);
+
+        // Total free energy change
+        let dg_total = dg_mrna_rrna_withspacing + dg_start_codon - dg_mrna - dg_standby;
+
+        // Expression level
+        let expression = calc_expression_level(dg_total);
+
+        let rbs_distance_bp = if spacing_value.is_finite() {
+            spacing_value.round() as i64
+        } else {
+            -1
+        };
+
+        results.push(OstirResult {
+            name: name.to_string(),
+            start_codon: codon.to_uppercase().replace('T', "U"),
+            start_position: start_pos + 1, // 1-indexed output
+            expression: round4(expression),
+            rbs_distance_bp,
+            dg_total: round4(dg_total),
+            dg_rrna_mrna: round4(dg_mrna_rrna_nospacing),
+            dg_mrna: round4(dg_mrna),
+            dg_spacing: round4(structure.dg_spacing),
+            dg_standby: round4(dg_standby),
+            dg_start_codon: round4(dg_start_codon),
+        });
+    }
+
+    results.sort_by_key(|r| r.start_position);
+    results
+}
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
+#[derive(Parser, Debug)]
+#[command(name = "ostir", about = "Open Source Translation Initiation Rates")]
+struct Cli {
+    /// Input: FASTA file path or raw sequence string
+    #[arg(short = 'i', long)]
+    input: String,
+
+    /// Output CSV file (stdout if not provided)
+    #[arg(short = 'o', long)]
+    output: Option<String>,
+
+    /// Start position of search range, 1-indexed (default: 1)
+    #[arg(short = 's', long, default_value = "1")]
+    start: usize,
+
+    /// End position of search range, 1-indexed (default: sequence length)
+    #[arg(short = 'e', long)]
+    end: Option<usize>,
+
+    /// Anti-Shine-Dalgarno sequence (3' end of 16S rRNA)
+    #[arg(short = 'a', long, default_value = "ACCTCCTTA")]
+    asd: String,
+
+    /// Number of threads (currently unused)
+    #[arg(short = 'j', long, default_value = "1")]
+    threads: usize,
+
+    /// Circular sequence
+    #[arg(short = 'c', long)]
     circular: bool,
-    threads: i32,
-    bidirectional: bool,
-    verbosity: i32,
-) {
-    // Get start codon positions
-    let mut start_codon_positions: Vec<(usize, &str)> = vec![];
-    let start_codons: Vec<String> = vec![
-        "ATG".to_string(),
-        "GTG".to_string(),
-        "TTG".to_string(),
-        "CTG".to_string(),
-        "AUG".to_string(),
-        "GUG".to_string(),
-        "UUG".to_string(),
-        "CUG".to_string(),
-    ];
-    let tgt_sequence = &sequence.record;
-    for start_codon in start_codons {
-        let mut result: Vec<_> = tgt_sequence.match_indices(&start_codon).collect();
-        start_codon_positions.append(&mut result);
-    }
 
-    // Create Dataframe
-    let (_position, _codon): (Vec<usize>, Vec<&str>) =
-        start_codon_positions.iter().cloned().unzip();
-    let _df: DataFrame = df!(
-        "start_base" => Vec::<i64>::new(),
-        "start_codon" => Vec::<&str>::new(),
-    )
-    .unwrap();
-
-    // Set up progress bar
-    let _bar = ProgressBar::new(start_codon_positions.len().try_into().unwrap());
-
-    // Run calculations
-
-    // Return results
+    /// Verbosity level
+    #[arg(short = 'v', action = clap::ArgAction::Count)]
+    verbosity: u8,
 }
 
-fn test_mfe(test_seq_vec: &Vec<&str>) {
-    // test mfe
-    println!("MFE");
+fn main() {
+    let cli = Cli::parse();
 
-    let mfe = mfe(
-        test_seq_vec,
-        "placeholder",
-        37.0,
-        &types::DanglesSetting::new("all").unwrap(),
-    )
-    .unwrap();
-    // print mfe result as f32 and as string
-    println!("{}", mfe.get_d_g());
-    println!("{}", mfe.get_dots());
-    println!("{:?}", mfe.get_bp_x());
-    println!("{:?}", mfe.get_bp_y());
+    // Determine input sequences: either a FASTA file or a raw sequence string
+    let sequences: Vec<(String, String)> = if std::path::Path::new(&cli.input).exists() {
+        // Parse as FASTA
+        let content =
+            std::fs::read_to_string(&cli.input).expect("Failed to read input file");
+        parse_fasta_text(&content)
+    } else {
+        // Treat as raw sequence
+        vec![("unnamed".to_string(), cli.input.clone())]
+    };
+
+    // Set up CSV writer
+    let writer: Box<dyn io::Write> = match &cli.output {
+        Some(path) => Box::new(
+            std::fs::File::create(path).expect("Failed to create output file"),
+        ),
+        None => Box::new(io::stdout()),
+    };
+
+    let mut wtr = csv::Writer::from_writer(writer);
+
+    for (name, seq) in sequences {
+        let end = cli.end.unwrap_or(seq.len());
+        let results = ostir(&seq, &name, (cli.start, end), &cli.asd);
+        for r in results {
+            wtr.serialize(&r).expect("Failed to write CSV record");
+        }
+    }
+    wtr.flush().expect("Failed to flush CSV writer");
 }
 
-fn test_subopt(test_seq_vec: &Vec<&str>) {
-    // test subopt
-    println!("Subopt");
+/// Parse multi-FASTA text, returning (name, sequence) pairs.
+fn parse_fasta_text(content: &str) -> Vec<(String, String)> {
+    let mut sequences = Vec::new();
+    let mut current_name = String::new();
+    let mut current_seq = String::new();
 
-    let subopt = subopt(
-        test_seq_vec,
-        "placeholder",
-        50.0,
-        37.0,
-        &types::DanglesSetting::new("all").unwrap(),
-    );
-
-    // print subopt result
-    for result in subopt {
-        let dg = result.get_d_g();
-        let bp_x = result.get_bp_x();
-        let bp_y = result.get_bp_y();
-        println!("{}", dg);
-        println!("{}", result.get_dots());
-        println!("{:?}", bp_x);
-        println!("{:?}", bp_y);
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('>') {
+            if !current_seq.is_empty() {
+                sequences.push((current_name.clone(), current_seq.clone()));
+                current_seq.clear();
+            }
+            current_name = line[1..].trim().to_string();
+            if current_name.is_empty() {
+                current_name = "unnamed".to_string();
+            }
+        } else if !line.is_empty() {
+            current_seq.push_str(line);
+        }
     }
+    if !current_seq.is_empty() {
+        sequences.push((current_name, current_seq));
+    }
+    sequences
 }
