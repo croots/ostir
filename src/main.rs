@@ -116,21 +116,15 @@ fn compute_one(
         DanglesSetting::new("all").unwrap()
     };
 
-    eprintln!("[DEBUG] compute_one start_pos={} codon={}", start_pos, codon);
     let dg_mrna = calc_dg_mrna(sequence, start_pos, &dangles);
-    eprintln!("[DEBUG] dg_mrna={}", dg_mrna);
     let mrna_rrna_output = calc_dg_mrna_rrna(sequence, asd, start_pos, &dangles, None);
-    eprintln!("[DEBUG] mrna_rrna done");
 
     let (dg_mrna_rrna_withspacing_raw, structure, spacing_value) = mrna_rrna_output?;
-    eprintln!("[DEBUG] spacing_value={}", spacing_value);
 
     let dg_mrna_rrna_withspacing = dg_mrna_rrna_withspacing_raw - HYBRIDIZATION_PENALTY;
     let dg_mrna_rrna_nospacing = structure.dg_mrna_rrna - HYBRIDIZATION_PENALTY;
 
-    eprintln!("[DEBUG] calling standby site");
     let dg_standby = calc_dg_standby_site(&structure, asd, &dangles, None);
-    eprintln!("[DEBUG] dg_standby={}", dg_standby);
     let dg_start_codon = start_codon_energy(codon);
     let dg_total = dg_mrna_rrna_withspacing + dg_start_codon - dg_mrna - dg_standby;
     let expression = calc_expression_level(dg_total);
@@ -593,9 +587,37 @@ mod tests {
     }
 
     #[test]
+    fn test_vienna_mfe_after_subopt() {
+        use crate::vienna_wrapper::{mfe, subopt};
+        let dangles = DanglesSetting::new("all").unwrap();
+        // Step 1: mfe on full seq (calc_dg_mrna)
+        let seqs1 = vec!["ATAAGGAGGTATG"];
+        let r1 = mfe(&seqs1, "", 37.0, &dangles);
+        assert!(r1.is_ok(), "mfe on full seq should succeed");
+        drop(r1);
+        // Step 2: subopt on mrna + rrna
+        let seqs2 = vec!["ATAAGGAGGT", DEFAULT_ASD];
+        let r2 = subopt(&seqs2, "", 3.0, 37.0, &dangles);
+        assert!(!r2.is_empty(), "subopt should return results");
+        drop(r2);
+        // Step 3: mfe on pre-sequence "A" (single char)
+        let seqs3 = vec!["A"];
+        let r3 = mfe(&seqs3, "", 37.0, &dangles);
+        assert!(r3.is_ok(), "mfe on 'A' should succeed");
+        // Step 4: mfe on "AA" (two chars)
+        let seqs4 = vec!["AA"];
+        let r4 = mfe(&seqs4, "", 37.0, &dangles);
+        assert!(r4.is_ok(), "mfe on 'AA' should succeed");
+    }
+
+    #[test]
     fn test_fasta_seq() {
         let results = run("ATAAGGAGGTATG", 1, 13, DEFAULT_ASD);
         assert!(!results.is_empty(), "Expected at least one result");
+        // Previously crashed due to ViennaRNA density_of_states negative index bug
+        let r = &results[0];
+        assert_eq!(r.start_codon, "AUG");
+        assert_eq!(r.start_position, 11);
     }
 
     #[test]

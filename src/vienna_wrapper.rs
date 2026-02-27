@@ -1,70 +1,26 @@
 use crate::types::{DanglesSetting, FoldResult};
 use librna_sys::{
-    vrna_eval_structure, vrna_fold_compound, vrna_fold_compound_free, vrna_fold_compound_t,
-    vrna_md_set_default, vrna_md_t, vrna_mfe, vrna_subopt_cb,
+    vrna_eval_structure, vrna_fold_compound, vrna_md_set_default, vrna_md_t, vrna_mfe,
+    vrna_subopt_cb,
 };
-use std::cell::Cell;
 use std::error::Error;
 use std::ffi::{c_char, c_double, c_float, c_void, CStr, CString};
+use std::sync::Mutex;
 
-// Thread-local persistent md to avoid ViennaRNA global-state issues.
-// ViennaRNA stores a reference to the vrna_md_t address in global state;
-// reusing the same heap address across calls prevents a segfault that
-// occurs when a new md is allocated at a different address after vrna_subopt_cb.
-thread_local! {
-    static MD_CACHE: Cell<*mut vrna_md_t> = Cell::new(std::ptr::null_mut());
-}
+// ViennaRNA is not thread-safe — protect all calls with a global mutex.
+static VIENNA_LOCK: Mutex<()> = Mutex::new(());
 
-fn get_or_init_md() -> *mut vrna_md_t {
-    MD_CACHE.with(|cell| {
-        if cell.get().is_null() {
-            let ptr = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<vrna_md_t>() }));
-            unsafe { vrna_md_set_default(ptr); }
-            cell.set(ptr);
+fn make_md(dangles: &DanglesSetting, temp: f32) -> Box<vrna_md_t> {
+    unsafe {
+        // Heap-allocate so the address is stable after vrna_md_set_default.
+        let mut md = Box::new(std::mem::zeroed::<vrna_md_t>());
+        vrna_md_set_default(md.as_mut());
+        md.temperature = temp as c_double;
+        md.noLP = 1;
+        if let Ok(t) = dangles.as_int() {
+            md.dangles = t;
         }
-        cell.get()
-    })
-}
-
-// Fold compound struct with safeguards --------
-struct FoldCompound {
-    c: *mut vrna_fold_compound_t,
-}
-
-impl Drop for FoldCompound {
-    fn drop(&mut self) {
-        unsafe {
-            vrna_fold_compound_free(self.c);
-        }
-    }
-}
-
-impl FoldCompound {
-    fn new(sequences: &Vec<&str>, _constraints: &str, dangles: &DanglesSetting, temp: f32) -> Self {
-        let sequence = if sequences.len() > 1 {
-            sequences.join("&").replace("T", "U").to_uppercase()
-        } else {
-            sequences[0].replace("T", "U").to_uppercase()
-        };
-
-        // ViennaRNA requires null-terminated C strings
-        let c_sequence = CString::new(sequence).expect("Sequence contains null byte");
-
-        unsafe {
-            // Reuse the same heap-allocated md to keep its address stable across calls.
-            // ViennaRNA caches a reference to this address in global state, so changing
-            // the address between calls triggers a segfault.
-            let md = get_or_init_md();
-            (*md).temperature = temp as c_double;
-            (*md).noLP = 1;
-            match dangles.as_int() {
-                Ok(t) => (*md).dangles = t,
-                Err(_) => {}
-            }
-
-            let c = vrna_fold_compound(c_sequence.as_ptr(), md as *const vrna_md_t, 1 as u32);
-            FoldCompound { c }
-        }
+        md
     }
 }
 
@@ -76,28 +32,43 @@ pub fn mfe<'a>(
     temp: f32,
     dangles: &'_ DanglesSetting,
 ) -> Result<FoldResult<'a>, Box<dyn Error>> {
-    let dot_vec = vec![0u8; sequences.join("&").len() + 1];
-    let dot_ptr = dot_vec.as_ptr() as *mut i8;
-    let fold_compound = FoldCompound::new(sequences, constraints, dangles, temp);
-    let result;
-    unsafe {
-        result = vrna_mfe(fold_compound.c, dot_ptr);
+    // Guard: ViennaRNA requires at least 2 nucleotides for meaningful folding.
+    // For sequences that are too short, return a trivial result (all unpaired, energy 0).
+    let total_len: usize = sequences.iter().map(|s| s.len()).sum();
+    if total_len < 2 {
+        let dots: String = sequences
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if i > 0 { format!("&{}", ".".repeat(s.len())) } else { ".".repeat(s.len()) }
+            })
+            .collect();
+        let (bp_x, bp_y) = dots_to_coordinates(&dots);
+        return Ok(FoldResult::create(Some(sequences), 0.0, dots, bp_x, bp_y));
     }
-    // Use CStr to properly strip the null terminator before processing
-    let dot_cstr = unsafe { CStr::from_ptr(dot_ptr as *const c_char) };
-    let dot_string = dot_cstr.to_str().expect("ViennaRNA returned invalid UTF-8");
-    let coordinates = dots_to_coordinates(dot_string);
 
-    // Round to 2 decimal places to match Python's ostir ViennaRNA.mfe() behavior
+    let _lock = VIENNA_LOCK.lock().unwrap();
+    let joined = sequences.join("&").replace("T", "U").to_uppercase();
+    let c_sequence = CString::new(joined.clone())?;
+    let md = make_md(dangles, temp);
+    let dot_vec = vec![0u8; joined.len() + 1];
+    let dot_ptr = dot_vec.as_ptr() as *mut i8;
+    let (result, dot_string) = unsafe {
+        let fc = vrna_fold_compound(c_sequence.as_ptr(), md.as_ref(), 1);
+        let result = vrna_mfe(fc, dot_ptr);
+        let dot_cstr = CStr::from_ptr(dot_ptr as *const c_char);
+        let dot_string = dot_cstr.to_str().expect("ViennaRNA returned invalid UTF-8").to_owned();
+        (result, dot_string)
+    };
+    let coordinates = dots_to_coordinates(&dot_string);
     let result_rounded = (result as f64 * 100.0).round() as f32 / 100.0;
-
-    return Ok(FoldResult::create(
+    Ok(FoldResult::create(
         Some(sequences),
         result_rounded,
-        dot_string.to_string(),
+        dot_string,
         coordinates.0,
         coordinates.1,
-    ));
+    ))
 }
 
 // Subopt ----------------
@@ -133,16 +104,19 @@ pub fn subopt<'a>(
     temp: f32,
     dangles: &'_ DanglesSetting,
 ) -> Vec<FoldResult<'a>> {
-    let fold_compound = FoldCompound::new(sequences, constraints, dangles, temp);
+    let _lock = VIENNA_LOCK.lock().unwrap();
+    let joined = sequences.join("&").replace("T", "U").to_uppercase();
+    let c_sequence = CString::new(joined).expect("Sequence contains null byte");
+    let md = make_md(dangles, temp);
 
     let mut resultholder: Vec<FoldResult> = vec![];
     let holder_ptr: *mut c_void = &mut resultholder as *mut _ as *mut c_void;
-
     let energy_gap_rounded: i32 = ((energy_gap + 2.481) * 100.0).round() as i32;
 
     unsafe {
+        let fc = vrna_fold_compound(c_sequence.as_ptr(), md.as_ref(), 1);
         vrna_subopt_cb(
-            fold_compound.c,
+            fc,
             energy_gap_rounded,
             Some(subopt_cb_fun as _),
             holder_ptr,
@@ -163,7 +137,7 @@ pub fn subopt<'a>(
         });
     }
 
-    return resultholder;
+    resultholder
 }
 
 // Evaluate Fold for Energy ----------------
@@ -173,15 +147,17 @@ pub fn eval_structure(
     temp: f32,
     dangles: &DanglesSetting,
 ) -> f64 {
+    let _lock = VIENNA_LOCK.lock().unwrap();
+    let joined = sequences.join("&").replace("T", "U").to_uppercase();
+    let c_sequence = CString::new(joined).expect("Sequence contains null byte");
     let adj_dots = dots.replace("&", "");
-    // ViennaRNA requires a null-terminated C string
     let c_dots = CString::new(adj_dots).expect("Structure string contains null byte");
-    let fold_compound = FoldCompound::new(sequences, "", dangles, temp);
+    let md = make_md(dangles, temp);
 
-    let energy: c_float;
-    unsafe {
-        energy = vrna_eval_structure(fold_compound.c, c_dots.as_ptr());
-    }
+    let energy: c_float = unsafe {
+        let fc = vrna_fold_compound(c_sequence.as_ptr(), md.as_ref(), 1);
+        vrna_eval_structure(fc, c_dots.as_ptr())
+    };
 
     // Round to 2 decimal places to match Python's ostir ViennaRNA.energy() behavior
     (energy as f64 * 100.0).round() / 100.0
