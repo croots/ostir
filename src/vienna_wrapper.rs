@@ -1,48 +1,68 @@
 use crate::types::{DanglesSetting, FoldResult};
 use librna_sys::{
-    vrna_eval_structure, vrna_fold_compound, vrna_fold_compound_t, vrna_md_set_default, vrna_md_t,
-    vrna_mfe, vrna_subopt_cb,
+    vrna_eval_structure, vrna_fold_compound, vrna_fold_compound_free, vrna_fold_compound_t,
+    vrna_md_set_default, vrna_md_t, vrna_mfe, vrna_subopt_cb,
 };
+use std::cell::Cell;
 use std::error::Error;
 use std::ffi::{c_char, c_double, c_float, c_void, CStr, CString};
-use std::mem::MaybeUninit;
+
+// Thread-local persistent md to avoid ViennaRNA global-state issues.
+// ViennaRNA stores a reference to the vrna_md_t address in global state;
+// reusing the same heap address across calls prevents a segfault that
+// occurs when a new md is allocated at a different address after vrna_subopt_cb.
+thread_local! {
+    static MD_CACHE: Cell<*mut vrna_md_t> = Cell::new(std::ptr::null_mut());
+}
+
+fn get_or_init_md() -> *mut vrna_md_t {
+    MD_CACHE.with(|cell| {
+        if cell.get().is_null() {
+            let ptr = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<vrna_md_t>() }));
+            unsafe { vrna_md_set_default(ptr); }
+            cell.set(ptr);
+        }
+        cell.get()
+    })
+}
 
 // Fold compound struct with safeguards --------
 struct FoldCompound {
     c: *mut vrna_fold_compound_t,
 }
 
+impl Drop for FoldCompound {
+    fn drop(&mut self) {
+        unsafe {
+            vrna_fold_compound_free(self.c);
+        }
+    }
+}
+
 impl FoldCompound {
     fn new(sequences: &Vec<&str>, _constraints: &str, dangles: &DanglesSetting, temp: f32) -> Self {
-        let sequence;
-        if sequences.len() > 1 {
-            sequence = sequences.join("&").replace("T", "U").to_uppercase()
+        let sequence = if sequences.len() > 1 {
+            sequences.join("&").replace("T", "U").to_uppercase()
         } else {
-            sequence = sequences[0].replace("T", "U").to_uppercase()
-        }
+            sequences[0].replace("T", "U").to_uppercase()
+        };
 
         // ViennaRNA requires null-terminated C strings
         let c_sequence = CString::new(sequence).expect("Sequence contains null byte");
 
         unsafe {
-            let mut md = MaybeUninit::<vrna_md_t>::uninit();
-            let md_ptr = md.as_mut_ptr();
-            vrna_md_set_default(md_ptr);
-            let mut initialized_md = md.assume_init();
-
-            initialized_md.temperature = temp as c_double;
-            // Match Python's ostir parameters: no lonely pairs, no pseudoknots
-            initialized_md.noLP = 1;
-
-            let _dangles_int = dangles.as_int();
+            // Reuse the same heap-allocated md to keep its address stable across calls.
+            // ViennaRNA caches a reference to this address in global state, so changing
+            // the address between calls triggers a segfault.
+            let md = get_or_init_md();
+            (*md).temperature = temp as c_double;
+            (*md).noLP = 1;
             match dangles.as_int() {
-                Ok(t) => initialized_md.dangles = t,
-                Err(_e) => {}
+                Ok(t) => (*md).dangles = t,
+                Err(_) => {}
             }
 
-            let c = vrna_fold_compound(c_sequence.as_ptr(), &initialized_md, 1 as u32);
-            // TODO: Add constraints
-
+            let c = vrna_fold_compound(c_sequence.as_ptr(), md as *const vrna_md_t, 1 as u32);
             FoldCompound { c }
         }
     }
@@ -56,8 +76,6 @@ pub fn mfe<'a>(
     temp: f32,
     dangles: &'_ DanglesSetting,
 ) -> Result<FoldResult<'a>, Box<dyn Error>> {
-    // @TODO: Add constraints option
-
     let dot_vec = vec![0u8; sequences.join("&").len() + 1];
     let dot_ptr = dot_vec.as_ptr() as *mut i8;
     let fold_compound = FoldCompound::new(sequences, constraints, dangles, temp);
@@ -84,16 +102,18 @@ pub fn mfe<'a>(
 
 // Subopt ----------------
 unsafe extern "C" fn subopt_cb_fun(x: *const c_char, y: c_float, z: *mut c_void) {
-    let optional_char = x.as_ref(); // Catch a returned null pointer
-    match optional_char {
-        Some(_t) => {}
-        None => return,
+    // ViennaRNA calls the callback with NULL to signal the end of subopt results
+    if x.is_null() {
+        return;
     }
 
     let data: &mut Vec<FoldResult> = unsafe { &mut *(z as *mut Vec<FoldResult>) };
 
-    let placeholder = CStr::from_ptr(x);
-    let dots_string = placeholder.to_str().unwrap();
+    let placeholder = unsafe { CStr::from_ptr(x) };
+    let dots_string = match placeholder.to_str() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     let coordinates = dots_to_coordinates(dots_string);
     let result = FoldResult::create(
         None,
@@ -113,20 +133,12 @@ pub fn subopt<'a>(
     temp: f32,
     dangles: &'_ DanglesSetting,
 ) -> Vec<FoldResult<'a>> {
-    // error if temp < 0
-    // error if dangles no 'all', 'some', or 'none'
-    // energy_gap in kcal/mol
-
     let fold_compound = FoldCompound::new(sequences, constraints, dangles, temp);
-    let _vienna_temperature = (temp * 100 as f32).round() as i32;
 
     let mut resultholder: Vec<FoldResult> = vec![];
     let holder_ptr: *mut c_void = &mut resultholder as *mut _ as *mut c_void;
 
-    let hybridization_penalty = 2.481 as f32;
-
-    let _energy_gap_adjusted = (energy_gap + hybridization_penalty) * 100.0;
-    let energy_gap_rounded: i32 = ((energy_gap + hybridization_penalty) * 100.0).round() as i32;
+    let energy_gap_rounded: i32 = ((energy_gap + 2.481) * 100.0).round() as i32;
 
     unsafe {
         vrna_subopt_cb(
@@ -206,16 +218,7 @@ pub fn coordinates_to_dots(strands: &Vec<&str>, bp_x: &Vec<usize>, bp_y: &Vec<us
 
 pub fn dots_to_coordinates(dots_string: &str) -> (Vec<usize>, Vec<usize>) {
     let mut bp_x: Vec<usize> = vec![];
-    let _unpaired_x_index: Vec<usize> = vec![];
-    let _unpaired_x_pos: Vec<usize> = vec![];
     let mut bp_y: Vec<usize> = vec![];
-
-    let _i = 1; // Dot positions are 1 indexed
-    let _x_counter = 0;
-    let _strand_count = 0;
-
-    let mut _last_x_pos: usize;
-    let mut _last_x_index: usize;
 
     for _ in 0..dots_string.matches(")").count() {
         bp_y.push(0); // Placeholder value to be replaced later
@@ -232,7 +235,7 @@ pub fn dots_to_coordinates(dots_string: &str) -> (Vec<usize>, Vec<usize>) {
                 last_nt_x_list.push(pos - num_strands);
             }
             ')' => {
-                let nt_x = last_nt_x_list.pop().unwrap(); // nt_x is list of "(" except last entry
+                let nt_x = last_nt_x_list.pop().unwrap();
                 let nt_x_pos = bp_x
                     .iter()
                     .position(|&x| x == nt_x.try_into().unwrap())

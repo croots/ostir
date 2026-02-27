@@ -77,6 +77,7 @@ pub fn calc_dg_mrna_rrna(
         return None; // leaderless start codon
     }
 
+    eprintln!("[DBG] subopt mrna={:?} len={} rrna={:?}", mrna, mrna.len(), rrna);
     let seqs = vec![mrna, rrna];
     let subopt_results = subopt(
         &seqs,
@@ -85,10 +86,7 @@ pub fn calc_dg_mrna_rrna(
         DEFAULT_TEMP,
         dangles,
     );
-
-    if subopt_results.is_empty() {
-        return None;
-    }
+    eprintln!("[DBG] subopt returned {} results", subopt_results.len());
 
     // Calculate aligned spacing and energy+spacing for each result
     let mut aligned_spacings: Vec<f64> = Vec::new();
@@ -124,6 +122,7 @@ pub fn calc_dg_mrna_rrna(
     let best_result = &subopt_results[index];
     let bp_x = best_result.get_bp_x();
     let bp_y = best_result.get_bp_y();
+    eprintln!("[DBG] best index={} dots={:?} bp_x={:?} bp_y={:?}", index, best_result.get_dots(), bp_x, bp_y);
 
     let mrna_len_local = mrna.len();
 
@@ -162,20 +161,23 @@ pub fn calc_dg_mrna_rrna(
 
     // 1. Pre-sequence MFE folding
     if !mrna_pre.is_empty() {
+        eprintln!("[DBG] mfe pre mrna={:?}", mrna_pre);
         let seqs_pre = vec![mrna_pre];
         if let Ok(fold) = mfe(&seqs_pre, "", DEFAULT_TEMP, dangles) {
+            eprintln!("[DBG] mfe pre ok bp_x={:?}", fold.get_bp_x());
             total_bp_x.extend_from_slice(fold.get_bp_x());
             total_bp_y.extend_from_slice(fold.get_bp_y());
         }
     }
 
     // 2. rRNA binding site pairs, with rRNA offset applied
-    // rRNA offset = len(mrna_full) - len(mrna) = (mrna_len - begin) - (start_pos - begin) = startpos_to_end_len
     let rrna_offset = startpos_to_end_len;
+    eprintln!("[DBG] rrna_offset={} bp_x_target={:?} bp_y_target={:?}", rrna_offset, bp_x_target, bp_y_target);
     total_bp_x.extend_from_slice(&bp_x_target);
     for &nt_y in &bp_y_target {
         total_bp_y.push(nt_y + rrna_offset);
     }
+    eprintln!("[DBG] total_bp_x={:?} total_bp_y={:?}", total_bp_x, total_bp_y);
 
     // 3. Post-sequence MFE folding (typically empty)
     if !mrna_post.is_empty() {
@@ -191,9 +193,13 @@ pub fn calc_dg_mrna_rrna(
 
     // Evaluate total energy using the full window mRNA + rRNA
     let mrna_full = &mrna_in[begin..mrna_len];
+    eprintln!("[DBG] mrna_full={:?} len={} rrna={:?} len={}", mrna_full, mrna_full.len(), rrna, rrna.len());
+    eprintln!("[DBG] building dots...");
     let dots = coordinates_to_dots(&vec![mrna_full, rrna], &total_bp_x, &total_bp_y);
+    eprintln!("[DBG] dots={:?} len={}", dots, dots.len());
     let total_energy =
         eval_structure(&vec![mrna_full, rrna], &dots, DEFAULT_TEMP, dangles) as f64;
+    eprintln!("[DBG] total_energy={}", total_energy);
     let total_energy_withspacing = total_energy + dg_spacing_final;
 
     let structure = MRNARRNAStructure {
