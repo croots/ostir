@@ -1,13 +1,38 @@
 use crate::types::{DanglesSetting, FoldResult};
 use librna_sys::{
     vrna_eval_structure, vrna_fold_compound, vrna_md_set_default, vrna_md_t, vrna_mfe,
-    vrna_subopt_cb,
+    vrna_params_load_defaults, vrna_subopt_cb,
 };
 use std::error::Error;
 use std::ffi::{c_char, c_double, c_float, c_void, CStr, CString};
 use std::sync::Mutex;
 
-// ViennaRNA is not thread-safe — protect all calls with a global mutex.
+// ViennaRNA thread-safety notes:
+//
+// vrna_mfe and vrna_eval_structure are safe to call concurrently when each
+// caller creates its own vrna_fold_compound_t — they do not write to shared
+// global state under normal operation.
+//
+// vrna_subopt_cb is NOT thread-safe: it writes to the PUBLIC global array
+// `density_of_states[MAXDOS+1]` on every result, and in ViennaRNA ≤ 2.6.4 it
+// also has a latent bug where floating-point rounding can produce a negative
+// index (e = -1), writing one word before the array and corrupting the adjacent
+// `last_param_file` global pointer.  A subsequent call to vrna_fold_compound
+// will then crash inside strncpy trying to copy from that invalid address.
+//
+// Hardening strategy:
+//  1. Hold VIENNA_LOCK for the entire subopt call so density_of_states writes
+//     and the potential corruption of last_param_file are serialised against
+//     any concurrent mfe / eval_structure caller that would read last_param_file
+//     inside vrna_fold_compound.
+//  2. While still holding the lock, call vrna_params_load_defaults() after
+//     vrna_subopt_cb returns.  This resets last_param_file to a valid heap
+//     string ("RNA - Turner 2004") so that the corrupted value never escapes
+//     the critical section.
+//
+// mfe and eval_structure also acquire the lock so they are protected against a
+// concurrent subopt that might corrupt last_param_file between their lock
+// acquisition and the vrna_fold_compound call inside them.
 static VIENNA_LOCK: Mutex<()> = Mutex::new(());
 
 fn make_md(dangles: &DanglesSetting, temp: f32) -> Box<vrna_md_t> {
@@ -121,6 +146,12 @@ pub fn subopt<'a>(
             Some(subopt_cb_fun as _),
             holder_ptr,
         );
+        // Harden against the ViennaRNA ≤ 2.6.4 density_of_states[-1] bug:
+        // if the OOB write corrupted last_param_file, reset it to a valid
+        // pointer by reloading the default energy parameters.  This must
+        // happen while the lock is still held so that no concurrent
+        // vrna_fold_compound call can observe the corrupted value.
+        vrna_params_load_defaults();
     }
 
     resultholder.sort_by(|b, a| b.get_d_g().partial_cmp(&a.get_d_g()).unwrap());
