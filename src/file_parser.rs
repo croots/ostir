@@ -1,3 +1,143 @@
+use std::path::Path;
+
+/// Parse multi-FASTA text, returning (name, sequence) pairs.
+pub fn parse_fasta_str(content: &str) -> Vec<(String, String)> {
+    let mut sequences = Vec::new();
+    let mut current_name = String::new();
+    let mut current_seq = String::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('>') {
+            if !current_seq.is_empty() {
+                sequences.push((current_name.clone(), current_seq.clone()));
+                current_seq.clear();
+            }
+            current_name = line[1..].trim().to_string();
+            if current_name.is_empty() {
+                current_name = "unnamed".to_string();
+            }
+        } else if !line.is_empty() {
+            current_seq.push_str(line);
+        }
+    }
+    if !current_seq.is_empty() {
+        sequences.push((current_name, current_seq));
+    }
+    sequences
+}
+
+/// A single input sequence with all parameters for an OSTIR run.
+#[derive(Debug, Clone)]
+pub struct OstirInput {
+    pub sequence: String,
+    pub name: String,
+    pub asd: String,
+    pub start: usize,  // 1-indexed
+    pub end: Option<usize>, // 1-indexed; None = sequence length
+    pub circular: bool,
+    pub print_sequence: bool,
+    pub print_asd: bool,
+}
+
+impl OstirInput {
+    pub fn new(sequence: String, name: String) -> Self {
+        OstirInput {
+            sequence,
+            name,
+            asd: "ACCTCCTTA".to_string(),
+            start: 1,
+            end: None,
+            circular: false,
+            print_sequence: false,
+            print_asd: false,
+        }
+    }
+}
+
+/// Parse a FASTA file into OstirInput records, applying CLI defaults.
+pub fn parse_fasta_file(path: &Path, defaults: &OstirInput) -> Result<Vec<OstirInput>, std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    let pairs = parse_fasta_str(&content);
+    Ok(pairs
+        .into_iter()
+        .map(|(name, seq)| OstirInput {
+            sequence: seq,
+            name,
+            asd: defaults.asd.clone(),
+            start: defaults.start,
+            end: defaults.end,
+            circular: defaults.circular,
+            print_sequence: defaults.print_sequence,
+            print_asd: defaults.print_asd,
+        })
+        .collect())
+}
+
+/// Parse a CSV file into OstirInput records.
+/// Supports columns: sequence/seq, name/id, anti-Shine-Dalgarno, start, end, circular
+pub fn parse_csv_file(path: &Path, defaults: &OstirInput) -> Result<Vec<OstirInput>, std::io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    let mut inputs = Vec::new();
+    let mut idx = 0usize;
+
+    // Strip blank/comment lines then feed to csv reader
+    let filtered: String = content
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+        .map(|l| format!("{}\n", l))
+        .collect();
+
+    let mut rdr = csv::Reader::from_reader(filtered.as_bytes());
+    let headers: Vec<String> = rdr
+        .headers()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .iter()
+        .map(|h| h.to_lowercase())
+        .collect();
+
+    for record in rdr.records() {
+        idx += 1;
+        let record = record.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let get = |key: &str| -> Option<String> {
+            headers.iter().position(|h| h == key).and_then(|i| record.get(i)).map(|v| v.to_string()).filter(|v| !v.is_empty())
+        };
+
+        let sequence = get("sequence").or_else(|| get("seq"))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing 'sequence'/'seq' column"))?;
+        let sequence = sequence.replace(' ', "");
+
+        let name = get("name").or_else(|| get("id")).unwrap_or_else(|| format!("sequence_{}", idx));
+
+        let asd = get("anti-shine-dalgarno")
+            .or_else(|| get("anti_shine_dalgarno"))
+            .unwrap_or_else(|| defaults.asd.clone());
+        let asd = if asd.is_empty() { defaults.asd.clone() } else { asd };
+
+        let start = get("start")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(defaults.start);
+        let end = get("end")
+            .and_then(|v| v.parse::<usize>().ok())
+            .or(defaults.end);
+        let circular = get("circular")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "t" | "yes" | "y" | "1"))
+            .unwrap_or(defaults.circular);
+
+        inputs.push(OstirInput {
+            sequence,
+            name,
+            asd,
+            start,
+            end,
+            circular,
+            print_sequence: defaults.print_sequence,
+            print_asd: defaults.print_asd,
+        });
+    }
+    Ok(inputs)
+}
+
 pub mod fileparser {
     use std::char;
     use std::io::Error;
